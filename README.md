@@ -1,71 +1,96 @@
 # poc-wasabi-coordinator-dos
 
 Unauthenticated CPU-exhaustion in the WalletWasabi coordinator, caused by **unbounded
-pre-authentication collection processing** in its request deserialization.
+pre-authentication collection processing** in its request deserialization. Demonstrated two
+ways: a direct measurement of the deserialization cost, and an end-to-end test where a real
+coinjoin round **fails** under the attack.
 
 ## The bug
 
-The coordinator decodes request bodies with a custom JSON layer (`WalletWasabi/Serialization`).
-Two properties combine:
+The coordinator decodes request bodies with a custom JSON layer (`WalletWasabi/Serialization`):
 
-1. **Uncapped collections.** The generic array decoder `Array<T>` (`Primitives.cs:154`) and
-   `GroupElementVector` (`WabiSabi.cs:77`) read `EnumerateArray()` into a list with **no length
-   limit**. `Presented` / `Requested` / `Proofs` and their nested `PublicNonces` /
-   `BitCommitments` arrays are all unbounded.
-2. **Eager per-element EC work.** Each group element is decoded with `GroupElement.FromBytes`,
-   which performs an **on-curve check (a field square root)** — measured ~9 µs/element.
+1. **Uncapped collections.** `Array<T>` (`Primitives.cs:154`) and `GroupElementVector`
+   (`WabiSabi.cs:77`) read `EnumerateArray()` into a list with **no length limit**.
+   `Presented` / `Requested` / `Proofs` and their nested `PublicNonces` / `BitCommitments`
+   arrays are all unbounded.
+2. **Eager per-element EC work.** Each group element is decoded via `GroupElement.FromBytes`,
+   an **on-curve check (field square root)** — ~9 µs/element.
 
-Decoding runs in `WasabiJsonInputFormatter` during model binding, i.e. **before** the
-controller action and before any `AliceId` / round / ownership / UTXO validation in `Arena`
-(e.g. `ConfirmConnectionAsync`, `RegisterInputAsync`).
+Decoding runs in `WasabiJsonInputFormatter` during model binding, **before** the controller
+action and before any `AliceId` / round / ownership / UTXO validation (`RegisterInputAsync`,
+`ConfirmConnectionAsync`, …). No `[Authorize]`, no rate limiting, no in-app body cap (Kestrel
+default ~30 MB). A 5 s `RequestTimeout` policy does not help: a 30 MB body decodes in ~4.2 s
+(< 5 s, never triggered) and the synchronous decode loop observes no cancellation token.
 
-## Measured (against the coordinator's real decoder)
+## Evidence 1 — deserialization CPU cost (`DosPoc` console app)
 
-`DosPoc` drives the exact method the formatter calls, `Decode.CoordinatorMessageFromStreamAsync`,
-with a crafted `ConnectionConfirmationRequest` whose `RealAmountCredentialRequests.Proofs[0].PublicNonces`
-is oversized:
+Drives the exact method the formatter calls, `Decode.CoordinatorMessageFromStreamAsync`, on a
+crafted `ConnectionConfirmationRequest` with an oversized `PublicNonces`:
 
 ```
-  PublicNonces=  10000  body= 0.7 MB  decode=0.12 s  materialized=True
-  PublicNonces= 100000  body= 6.6 MB  decode=1.06 s  materialized=True
-  PublicNonces= 300000  body=19.7 MB  decode=2.87 s  materialized=True
-  PublicNonces= 449000  body=29.5 MB  decode=4.24 s  materialized=True   (~30 MB Kestrel default cap)
+  PublicNonces=  10000  body= 0.7 MB  decode=0.12 s
+  PublicNonces= 100000  body= 6.6 MB  decode=1.06 s
+  PublicNonces= 300000  body=19.7 MB  decode=2.87 s
+  PublicNonces= 449000  body=29.5 MB  decode=4.24 s   (~30 MB Kestrel default cap)
 ```
 
-`materialized=True` — the full request object is built and handed toward the (pre-auth)
-controller. **~4 s of single-core CPU per ~30 MB request, unauthenticated.** CPU scales
-linearly with the attacker-controlled collection size. Invalid points cost the same on-curve
-attempt, so no valid credentials/UTXO are needed.
+~4 s single-core CPU per ~30 MB request, unauthenticated, linear in the attacker-controlled
+collection size. Invalid points cost the same on-curve attempt, so no valid credentials/UTXO
+are needed.
+
+## Evidence 2 — end-to-end: a real coinjoin round fails under attack (`tests/`)
+
+`WabiSabiDosPoCTests` runs against the coordinator's real HTTP pipeline (in-process TestServer
++ mock RPC, no bitcoind). Measured on a 4-core box, each test in its own process:
+
+- **`DosPoC_CoordinatorLatencyAsync`** (unconfounded — no coinjoin client, isolates the
+  coordinator): honest `/status` latency **baseline median 0 ms → under flood median 541 ms,
+  max 6485 ms** (≈541× slowdown). The coordinator can no longer serve honest requests promptly.
+
+- **`DosPoC_CoinJoinRoundAsync`**: a real coinjoin round **succeeds without the attacker
+  (`SuccessfulCoinJoinResult`, ~19 s) and FAILS under the flood (`FailedCoinJoinResult`, ~90 s)**.
+
+The flood is 48 concurrent workers POSTing ~10 MB oversized `connection-confirmation` bodies.
 
 ## Severity assessment
 
 | Question | Answer (evidence) |
 |---|---|
-| Remotely reachable without auth? | **Yes.** No `[Authorize]`, no `UseAuthentication/Authorization` on the coordinator; decode happens in the input formatter before the action. |
-| Rate limiting? | **None** found in the coordinator (`Startup.cs`) or the app. |
-| Concurrent requests? | **Yes** — ASP.NET Core serves requests in parallel; the PoC's concurrency demo shows simultaneous decodes running on separate cores. |
-| CPU linear in collection size? | **Yes** — measured 0.7→29.5 MB scales 0.12→4.24 s. |
-| Max HTTP body? | Kestrel **default ~30 MB** (no `MaxRequestBodySize` override), so ~4 s CPU is the per-request ceiling. |
-| One attacker exhaust all cores? | **Yes, given bandwidth.** Each request pins a thread for ~4 s of CPU; N concurrent connections pin N cores. |
-| Prevents rounds progressing / serving participants? | **Plausible, reasoned not proven.** Saturating the coordinator's cores delays or drops legitimate registration/confirmation requests; WabiSabi phases have timeouts, so sustained saturation stalls or fails rounds. Not demonstrated end-to-end here. |
-| Sustainable cheaply over the network? | **Partly.** Cost is ~linear (~30 MB in ≈ 4 CPU-s ≈ ~60 Mbps to keep one core busy). Not a small-packet amplifier — sustaining broad saturation needs real bandwidth (e.g. a botnet). |
+| Remotely reachable without auth? | **Yes** — no `[Authorize]`/auth middleware; decode is in the input formatter before the action. |
+| Rate limiting? | **None** found. |
+| Concurrent? | **Yes** — parallel on the thread pool. |
+| CPU linear in collection size? | **Yes** — 0.7→29.5 MB ⇒ 0.12→4.24 s. |
+| Max HTTP body? | Kestrel **default ~30 MB** (no override) ⇒ ~4 s CPU/request ceiling. |
+| Exhaust all cores? | **Yes given bandwidth** — each request pins a thread ~4 s; honest `/status` latency measured at up to 6.5 s under flood. |
+| Prevents rounds / serving participants? | **Demonstrated** — a real round goes `Successful`→`Failed` under the flood, and honest requests are delayed to seconds. |
+| Sustainable cheaply? | **Partly** — ~1:1 (~30 MB ≈ 4 CPU-s ≈ ~60 Mbps to keep one core busy). Not a small-packet amplifier; broad saturation needs real bandwidth (botnet). |
 
-**Existing mitigations don't help:** there is a 5 s `RequestTimeout` policy, but a 30 MB body
-decodes in ~4.2 s (< 5 s, never triggered), and the synchronous decode loop observes no
-cancellation token, so the CPU is spent regardless.
+**Severity: High.** A publicly reachable, unauthenticated client with no rate limit can
+repeatedly consume multiple CPU-seconds per request, drive honest-request latency to seconds,
+and prevent coinjoin rounds from completing. **Not Critical** — impact is availability only; no
+funds compromise, no auth bypass, no other security-boundary crossing.
 
-**Severity: High is defensible** — a publicly reachable, unauthenticated client can repeatedly
-consume multiple CPU-seconds per request with no rate limit, degrading coordinator availability
-and round progression. **Not Critical:** the impact is availability only — no funds compromise,
-no authentication bypass, no other security-boundary crossing. A production coordinator behind
-a reverse proxy with body-size / rate limits would blunt it; the application code as written has
-no such cap.
+## Honest caveats
+
+- Measured on a **4-core box**; the flood ran **in-process** for the round test. The
+  `CoordinatorLatency` test is the clean, unconfounded signal (no coinjoin client competing);
+  the round-failure corroborates it. A remote attacker against a larger coordinator needs
+  proportional bandwidth (~60 Mbps/core) — it scales linearly, so a botnet reproduces it.
+- The tests use the in-process `TestServer`, not a live network socket; a production deployment
+  behind a reverse proxy with body-size / rate limits would blunt it. The application code as
+  written has no such cap.
+- The two Level-2 tests must be run **in separate processes** (the coordinator's global logger
+  may be configured only once per process).
 
 ## Run
 
 ```
-./setup.sh                          # clones WalletWasabi @ the pinned commit as a sibling
-dotnet run --project DosPoc -c Release
+./setup.sh
+dotnet build WalletWasabi/WalletWasabi.Tests/WalletWasabi.Tests.csproj -c Release
+dotnet run --project DosPoc -c Release                                   # Evidence 1
+cd WalletWasabi/WalletWasabi.Tests/bin/Release/net10.0
+./WalletWasabi.Tests --filter-display-name '*DosPoC_CoordinatorLatency*' # Evidence 2a
+./WalletWasabi.Tests --filter-display-name '*DosPoC_CoinJoinRound*'       # Evidence 2b
 ```
 Requires the .NET 10 SDK.
 
@@ -78,7 +103,5 @@ count, public nonces ≤ equations) and reject before materializing the array; a
 
 ## Scope
 
-This is a coordinator JSON-deserialization issue, independent of the KVAC issuer and almost
-certainly predating the native-issuer migration. The PoC exercises the decoder directly (the
-pre-auth code path and its CPU cost), not a live HTTP server; a live deployment's reverse-proxy /
-rate-limit configuration determines real-world reachability.
+A coordinator JSON-deserialization issue, independent of the KVAC issuer and almost certainly
+predating the native-issuer migration.
