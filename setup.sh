@@ -12,7 +12,11 @@ if [ ! -d WalletWasabi ]; then
 fi
 ( cd WalletWasabi && git remote set-url origin "$REPO" && git fetch -q origin && git checkout -q "$REF" )
 
-# Install the end-to-end test (Level 2) into the coordinator's integration test suite.
+# Install the integration tests into the coordinator's test suite:
+#   Evidence2KestrelTests.cs   - the real-Kestrel denial-of-service demonstration (Evidence 2)
+#   WabiSabiDosPoCTests.cs      - the per-request-cost regression guard
+cp tests/Evidence2KestrelTests.cs \
+   WalletWasabi/WalletWasabi.Tests/UnitTests/WabiSabi/Integration/Evidence2KestrelTests.cs
 cp tests/WabiSabiDosPoCTests.cs \
    WalletWasabi/WalletWasabi.Tests/UnitTests/WabiSabi/Integration/WabiSabiDosPoCTests.cs
 
@@ -23,9 +27,8 @@ mkdir -p "$CFG"
 
 echo "setup done."
 echo "Build:  dotnet build WalletWasabi/WalletWasabi.Tests/WalletWasabi.Tests.csproj -c Release"
-echo "Run the Console app (deserialization CPU cost):  dotnet run --project DosPoc -c Release"
-echo "Run the Level-2 tests INDIVIDUALLY (a per-process global logger forbids running both in one process):"
+echo "Run the Console app (Evidence 1, per-request CPU cost):  dotnet run --project DosPoc -c Release"
+echo "Run the integration tests:"
 echo "  cd WalletWasabi/WalletWasabi.Tests/bin/Release/net10.0"
-echo "  ./WalletWasabi.Tests --filter-display-name '*DosPoC_CoordinatorLatency*'   # honest /status latency under flood"
-echo "  ./WalletWasabi.Tests --filter-display-name '*DosPoC_CoinJoinRound*'        # a real round fails under flood"
-echo "  ./WalletWasabi.Tests --filter-display-name '*DosPoC_FixNeutralizesFlood*' # (build against the PR head) the fix neutralizes the flood"
+echo "  ./WalletWasabi.Tests --filter-display-name '*RealKestrelStarvation*'       # Evidence 2: honest requests denied on real Kestrel"
+echo "  ./WalletWasabi.Tests --filter-display-name '*DosPoC_FixNeutralizesFlood*'  # (build against the PR head) the fix neutralizes the flood"

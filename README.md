@@ -1,9 +1,9 @@
 # poc-wasabi-coordinator-dos
 
 Unauthenticated CPU-exhaustion in the WalletWasabi coordinator, caused by **unbounded
-pre-authentication collection processing** in its request deserialization. Demonstrated two
-ways: a direct measurement of the deserialization cost, and an end-to-end test where a real
-coinjoin round **fails** under the attack.
+pre-authentication collection processing** in its request deserialization. Shown two ways: a
+direct measurement of the per-request deserialization cost, and an end-to-end test where honest
+requests to a real coordinator are **starved to seconds** under an unauthenticated flood.
 
 ## The bug
 
@@ -38,19 +38,27 @@ crafted `ConnectionConfirmationRequest` with an oversized `PublicNonces`:
 collection size. Invalid points cost the same on-curve attempt, so no valid credentials/UTXO
 are needed.
 
-## Evidence 2 — end-to-end: a real coinjoin round fails under attack (`tests/`)
+## Evidence 2 — end-to-end denial of service on a real coordinator (`tests/`)
 
-`WabiSabiDosPoCTests` runs against the coordinator's real HTTP pipeline (in-process TestServer
-+ mock RPC, no bitcoind). Measured on a 4-core box, each test in its own process:
+`Evidence2KestrelTests.RealKestrelStarvationAsync` runs the coordinator on a **real Kestrel
+server** bound to a loopback port (not the in-process `TestServer`) with a mock RPC. It floods
+the server over real HTTP connections with unauthenticated oversized `connection-confirmation`
+bodies, then times an honest `/status` request while the flood runs. Workers scale with core
+count so the oversized decodes saturate every core.
 
-- **`DosPoC_CoordinatorLatencyAsync`** (unconfounded — no coinjoin client, isolates the
-  coordinator): honest `/status` latency **baseline median 0 ms → under flood median 541 ms,
-  max 6485 ms** (≈541× slowdown). The coordinator can no longer serve honest requests promptly.
+Measured on a 4-core box against the vulnerable coordinator:
 
-- **`DosPoC_CoinJoinRoundAsync`**: a real coinjoin round **succeeds without the attacker
-  (`SuccessfulCoinJoinResult`, ~19 s) and FAILS under the flood (`FailedCoinJoinResult`, ~90 s)**.
+```
+  honest /status: baseline median 2 ms; under flood median 1031 ms, max 12810 ms (workers=32)
+```
 
-The flood is 48 concurrent workers POSTing ~10 MB oversized `connection-confirmation` bodies.
+Honest requests go from about 2 ms to a **median near one second, with a worst case close to 13
+seconds**. That is honest users denied timely service, which is what makes this a DoS rather than
+just an expensive request.
+
+Why a real server is required: the in-process `TestServer` does not schedule the synchronous
+decode work the way Kestrel does, so an in-process flood leaves honest `/status` near 1 ms and
+hides the impact. The starvation only appears on real Kestrel.
 
 ## Severity assessment
 
@@ -61,8 +69,8 @@ The flood is 48 concurrent workers POSTing ~10 MB oversized `connection-confirma
 | Concurrent? | **Yes** — parallel on the thread pool. |
 | CPU linear in collection size? | **Yes** — 0.7→29.5 MB ⇒ 0.12→4.24 s. |
 | Max HTTP body? | Kestrel **default ~30 MB** (no override) ⇒ ~4 s CPU/request ceiling. |
-| Exhaust all cores? | **Yes given bandwidth** — each request pins a thread ~4 s; honest `/status` latency measured at up to 6.5 s under flood. |
-| Prevents rounds / serving participants? | **Demonstrated** — a real round goes `Successful`→`Failed` under the flood, and honest requests are delayed to seconds. |
+| Exhaust all cores? | **Yes given bandwidth** — each request pins a thread ~3 s; workers scale with cores. |
+| Prevents serving participants? | **Demonstrated** — on real Kestrel honest `/status` goes from ~2 ms to a ~1 s median and ~13 s worst case under the flood. |
 | Sustainable cheaply? | **Partly** — ~1:1 (~30 MB ≈ 4 CPU-s ≈ ~60 Mbps to keep one core busy). Not a small-packet amplifier; broad saturation needs real bandwidth (botnet). |
 
 **Severity: High.** A publicly reachable, unauthenticated client with no rate limit can
@@ -72,25 +80,24 @@ funds compromise, no auth bypass, no other security-boundary crossing.
 
 ## Honest caveats
 
-- Measured on a **4-core box**; the flood ran **in-process** for the round test. The
-  `CoordinatorLatency` test is the clean, unconfounded signal (no coinjoin client competing);
-  the round-failure corroborates it. A remote attacker against a larger coordinator needs
-  proportional bandwidth (~60 Mbps/core) — it scales linearly, so a botnet reproduces it.
-- The tests use the in-process `TestServer`, not a live network socket; a production deployment
-  behind a reverse proxy with body-size / rate limits would blunt it. The application code as
-  written has no such cap.
-- The two Level-2 tests must be run **in separate processes** (the coordinator's global logger
-  may be configured only once per process).
+- Measured on a **4-core box**. The flood client runs in the same process as the coordinator, so
+  it competes for the same CPU. A remote attacker needs proportional bandwidth (about 60 Mbps per
+  core); the cost is linear, so a botnet reproduces it.
+- The starvation only appears against a **real Kestrel** server. The in-process `TestServer` does
+  not reproduce it (honest `/status` stays near 1 ms), which is why Evidence 2 stands up a real
+  server. `WabiSabiDosPoCTests` uses the in-process harness only for the deterministic per-request
+  cost, which is the regression guard, not for the starvation.
+- A production deployment behind a reverse proxy with body-size or rate limits would blunt it. The
+  application code as written has no such cap.
 
 ## Run
 
 ```
 ./setup.sh
 dotnet build WalletWasabi/WalletWasabi.Tests/WalletWasabi.Tests.csproj -c Release
-dotnet run --project DosPoc -c Release                                   # Evidence 1
+dotnet run --project DosPoc -c Release                                # Evidence 1: per-request CPU cost
 cd WalletWasabi/WalletWasabi.Tests/bin/Release/net10.0
-./WalletWasabi.Tests --filter-display-name '*DosPoC_CoordinatorLatency*' # Evidence 2a
-./WalletWasabi.Tests --filter-display-name '*DosPoC_CoinJoinRound*'       # Evidence 2b
+./WalletWasabi.Tests --filter-display-name '*RealKestrelStarvation*'  # Evidence 2: honest requests denied
 ```
 Requires the .NET 10 SDK.
 
@@ -123,14 +130,16 @@ REF=fix/unbounded-credential-collection-dos \
 dotnet build WalletWasabi/WalletWasabi.Tests/WalletWasabi.Tests.csproj -c Release
 dotnet run --project DosPoc -c Release                                     # prints REJECTED, decode collapses
 cd WalletWasabi/WalletWasabi.Tests/bin/Release/net10.0
-./WalletWasabi.Tests --filter-display-name '*DosPoC_FixNeutralizesFlood*'  # regression guard
+./WalletWasabi.Tests --filter-display-name '*DosPoC_FixNeutralizesFlood*'  # regression guard: passes on fixed
+./WalletWasabi.Tests --filter-display-name '*RealKestrelStarvation*'       # Evidence 2: now fails (no starvation)
 ```
 
 On the fixed build the console app reports `REJECTED (fix present)` for every oversized body and
-the decode time drops to a plain DOM-parse cost with no per-element curve work. The regression
-test `DosPoC_FixNeutralizesFloodAsync` passes: the oversized `connection-confirmation` is rejected
-before the curve work and honest `/status` stays responsive under the flood. Both assertions fail
-on the pinned vulnerable commit, which is the point.
+the decode time drops to a plain DOM-parse cost with no per-element curve work.
+`DosPoC_FixNeutralizesFloodAsync` passes: the oversized `connection-confirmation` is rejected
+before the curve work. And `RealKestrelStarvationAsync` now FAILS, because the same flood no
+longer starves honest requests: honest `/status` stays bounded (median about 120 ms, worst case
+about 135 ms) instead of reaching seconds. That failure is the proof the fix works.
 
 ## Scope
 
