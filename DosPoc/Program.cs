@@ -73,7 +73,8 @@ class DosPoc
         {
             var bodyBytes = Encoding.UTF8.GetBytes(Body(n)).Length;
             var (ok, ms) = await TimeDecode(n);
-            Console.WriteLine($"  PublicNonces={n,8}  body={bodyBytes / (1024.0 * 1024):F1} MB  decode={ms / 1000:F2} s  materialized={ok}");
+            string verdict = ok ? "MATERIALIZED (vulnerable)" : "REJECTED (fix present)";
+            Console.WriteLine($"  PublicNonces={n,8}  body={bodyBytes / (1024.0 * 1024):F1} MB  decode={ms / 1000:F2} s  {verdict}");
         }
 
         // Concurrency: N simultaneous decodes finish in ~the same wall time as one,
@@ -101,5 +102,10 @@ class DosPoc
         Console.WriteLine("the AliceId/round. No auth, no UTXO, no rate-limit at this layer; body cap is the");
         Console.WriteLine("Kestrel default (~30 MB). Attacker can send garbage points too (failed on-curve");
         Console.WriteLine("check costs the same), so no valid credentials are needed.");
+
+        Console.WriteLine("\nAgainst WalletWasabi PR #15066 the bounded decoders reject every oversized body");
+        Console.WriteLine("(REJECTED above) before the per-element curve work, so decode collapses to a plain");
+        Console.WriteLine("DOM-parse cost. See the README 'Verifying the fix' section and the end-to-end");
+        Console.WriteLine("regression test DosPoC_FixNeutralizesFlood.");
     }
 }

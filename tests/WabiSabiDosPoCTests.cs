@@ -68,8 +68,11 @@ public class WabiSabiDosPoCTests : IClassFixture<WabiSabiApiApplicationFactory<W
 		try { await flood; } catch { }
 		atkS.Sort();
 
-		Console.WriteLine($"[DosPoC] honest /status latency: baseline median {baseMed:F0} ms; under flood median {atkS[atkS.Count / 2]:F0} ms, max {atkS[^1]:F0} ms");
-		Assert.True(atkS[atkS.Count / 2] > baseMed * 20);
+		double atkMed = atkS[atkS.Count / 2];
+		Console.WriteLine($"[DosPoC] honest /status latency: baseline median {baseMed:F0} ms; under flood median {atkMed:F0} ms, max {atkS[^1]:F0} ms");
+		// The baseline median is frequently ~0 ms, so a purely relative bound degenerates to
+		// "> 0" and would pass on any nonzero latency. Require a real absolute slowdown as well.
+		Assert.True(atkMed > 100 && atkMed > Math.Max(baseMed, 1.0) * 20);
 	}
 
 	// (2) A real coinjoin round succeeds normally, but FAILS under the same flood.
@@ -92,7 +95,7 @@ public class WabiSabiDosPoCTests : IClassFixture<WabiSabiApiApplicationFactory<W
 					ConnectionConfirmationTimeout = TimeSpan.FromSeconds(20),
 					OutputRegistrationTimeout = TimeSpan.FromSeconds(20),
 					TransactionSigningTimeout = TimeSpan.FromSeconds(20),
-					MaxSuggestedAmountBase = Money.Satoshis(ProtocolConstants.MaxAmountPerAlice)
+					MaxSuggestedAmountBase = Money.Satoshis(WalletWasabi.Tests.UnitTests.WabiSabi.ProtocolConstants.MaxAmountPerAlice)
 				}))).CreateClient();
 
 			var apiClient = _factory.CreateWabiSabiHttpApiClient(httpClient);
@@ -117,6 +120,62 @@ public class WabiSabiDosPoCTests : IClassFixture<WabiSabiApiApplicationFactory<W
 		bool attacked = await RoundAsync(true);
 		Assert.True(baseline);    // a normal round completes
 		Assert.False(attacked);   // the unauthenticated flood prevents the coinjoin
+	}
+
+	// (3) Regression guard for WalletWasabi PR #15066. Built against the FIXED coordinator
+	// (see the README "Verifying the fix" section) the same flood is neutralized: the oversized
+	// connection-confirmation is rejected before the per-element curve work, and honest /status
+	// stays responsive. Both assertions FAIL on the pinned vulnerable commit, which is the point.
+	[Fact]
+	public async Task DosPoC_FixNeutralizesFloodAsync()
+	{
+		var httpClient = _factory.WithWebHostBuilder(b => b.AddMockRpcClient(Array.Empty<SmartCoin>(), _ => { })).CreateClient();
+
+		// (a) The oversized body the flood uses is rejected cheaply. On the fixed coordinator the
+		// collection and body caps reject it before the ~1.5 s of on-curve checks; on the
+		// vulnerable one the same request materializes and takes seconds, so latency separates them.
+		string oversized = OversizedConnectionConfirmation(150_000); // ~10 MB
+		var rejectMs = new List<double>();
+		int lastStatus = 0;
+		for (int i = 0; i < 5; i++)
+		{
+			using var c = new StringContent(oversized, Encoding.UTF8, "application/json");
+			var sw = System.Diagnostics.Stopwatch.StartNew();
+			using var r = await httpClient.PostAsync("WabiSabi/connection-confirmation", c);
+			sw.Stop();
+			rejectMs.Add(sw.Elapsed.TotalMilliseconds);
+			lastStatus = (int)r.StatusCode;
+			Assert.False(r.IsSuccessStatusCode); // never accepted
+		}
+		rejectMs.Sort();
+		double rejectMed = rejectMs[rejectMs.Count / 2];
+		Console.WriteLine($"[DosPoC-fix] oversized connection-confirmation: status {lastStatus}, median {rejectMed:F0} ms");
+		Assert.True(rejectMed < 750); // rejected before the per-element curve work
+
+		// (b) Honest /status stays responsive under the same flood.
+		async Task<double> StatusMsAsync()
+		{
+			var sw = System.Diagnostics.Stopwatch.StartNew();
+			using var c = new StringContent("{\"RoundCheckpoints\":[]}", Encoding.UTF8, "application/json");
+			using var r = await httpClient.PostAsync("WabiSabi/status", c);
+			sw.Stop();
+			return sw.Elapsed.TotalMilliseconds;
+		}
+
+		using var floodCts = new CancellationTokenSource();
+		var flood = FloodAsync(httpClient, floodCts.Token);
+		await Task.Delay(TimeSpan.FromSeconds(4));
+		var atkS = new List<double>();
+		for (int i = 0; i < 8; i++) atkS.Add(await StatusMsAsync());
+		floodCts.Cancel();
+		try { await flood; } catch { }
+		atkS.Sort();
+		double atkMed = atkS[atkS.Count / 2];
+		Console.WriteLine($"[DosPoC-fix] honest /status under flood: median {atkMed:F0} ms, max {atkS[^1]:F0} ms");
+		// The per-request assertion above is the strict discriminator (it fails on the vulnerable
+		// build). This is a loose "not starved" guard, kept generous so a correctly fixed build
+		// does not flake, since honest latency under an in-process flood is inherently noisy.
+		Assert.True(atkMed < 1000);
 	}
 
 	private static async Task FloodAsync(HttpClient client, CancellationToken ct)
